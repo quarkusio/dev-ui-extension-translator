@@ -3,7 +3,10 @@ package io.quarkus;
 import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.toMap;
 
+import java.io.BufferedReader;
+import java.io.Console;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -42,6 +45,8 @@ import picocli.CommandLine.Parameters;
 public class DevUITranslatorCommand implements Runnable {
 
     private static final Pattern STRING_LITERAL = Pattern.compile("(['\"])((?:\\\\.|(?!\\1).)*?)\\1");
+    private static final Pattern TEMPLATE_LITERAL = Pattern.compile("`((?:\\`|\\\\|[^`])*)`");
+    private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\$\\{([^}]*)\\}");
     private static final Pattern CONSTRUCTOR_PATTERN = Pattern.compile("constructor\\s*\\([^)]*\\)\\s*\\{");
     private static final Pattern EXISTING_MSG_PATTERN = Pattern.compile("msg\\s*\\(\\s*['\"]");
 
@@ -49,11 +54,10 @@ public class DevUITranslatorCommand implements Runnable {
             "fr", List.of("fr-FR", "fr-CA"),
             "de", List.of("de-AT", "de-CH"));
 
-    @Parameters(paramLabel = "<extension-root>", description = "Path to the Quarkus extension root")
+    @Parameters(paramLabel = "<extension-root>", description = "Path to the Quarkus extension root", arity = "0..1")
     Path extensionRoot;
 
-    @Option(names = {"-l", "--languages"}, split = ",", description = "Comma separated base languages to generate",
-            defaultValue = "fr,de")
+    @Option(names = {"-l", "--languages"}, split = ",", description = "Comma separated base languages to generate")
     List<String> languages;
 
     @Option(names = {"-d", "--dialects"}, split = ",",
@@ -68,6 +72,7 @@ public class DevUITranslatorCommand implements Runnable {
 
     @Override
     public void run() {
+        ensureUserInputs();
         configureOpenAi();
         Path devUiRoot = extensionRoot.resolve("deployment/src/main/resources/dev-ui");
         if (!Files.isDirectory(devUiRoot)) {
@@ -113,6 +118,21 @@ public class DevUITranslatorCommand implements Runnable {
         System.out.println("Translation complete at " + LocalDateTime.now());
     }
 
+    private void ensureUserInputs() {
+        if (extensionRoot == null) {
+            extensionRoot = promptForPath("Enter path to the Quarkus extension root: ");
+        }
+        if (languages == null || languages.isEmpty()) {
+            languages = promptForList("Enter comma separated base languages (e.g. fr,de) [default: fr,de]: ");
+            if (languages.isEmpty()) {
+                languages = new ArrayList<>(List.of("fr", "de"));
+            }
+        }
+        if (dialectOverrides == null) {
+            dialectOverrides = promptForList("Enter optional comma separated dialects (press Enter for defaults): ");
+        }
+    }
+
     private void configureOpenAi() {
         if (openAiApiKey != null && !openAiApiKey.isBlank()) {
             System.setProperty("quarkus.langchain4j.openai.chat-model.api-key", openAiApiKey);
@@ -138,26 +158,66 @@ public class DevUITranslatorCommand implements Runnable {
         return dialects;
     }
 
+    private List<String> promptForList(String prompt) {
+        String input = promptForInput(prompt);
+        if (input == null || input.isBlank()) {
+            return new ArrayList<>();
+        }
+        List<String> values = new ArrayList<>();
+        for (String token : input.split(",")) {
+            String trimmed = token.trim();
+            if (!trimmed.isBlank()) {
+                values.add(trimmed);
+            }
+        }
+        return values;
+    }
+
+    private Path promptForPath(String prompt) {
+        String input = promptForInput(prompt);
+        if (input == null || input.isBlank()) {
+            throw new IllegalStateException("A path to the Quarkus extension root is required.");
+        }
+        return Path.of(input.trim());
+    }
+
+    private String promptForInput(String prompt) {
+        Console console = System.console();
+        if (console != null) {
+            return console.readLine(prompt);
+        }
+        System.out.print(prompt);
+        System.out.flush();
+        try {
+            return new BufferedReader(new InputStreamReader(System.in)).readLine();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to read input", e);
+        }
+    }
+
     private Map<String, TranslationEntry> processFile(Path path, String artifactId) {
         try {
             String content = Files.readString(path);
-            Map<String, String> userStrings = extractUserStrings(content, artifactId);
-            String updated = applyLocalization(content, userStrings);
+            Set<String> usedKeys = new LinkedHashSet<>();
+            Map<String, String> userStrings = extractUserStrings(content, artifactId, usedKeys);
+            List<TemplateLocalization> templates = extractTemplateStrings(content, artifactId, usedKeys);
+            String updated = applyLocalization(content, userStrings, templates);
             if (!updated.equals(content)) {
                 Files.writeString(path, updated);
                 System.out.printf("Updated %s with localization hooks%n", path.getFileName());
             }
-            return userStrings.entrySet().stream()
+            Map<String, TranslationEntry> translations = userStrings.entrySet().stream()
                     .collect(toMap(Map.Entry::getValue, entry -> new TranslationEntry(entry.getKey(), false), (a, b) -> a, LinkedHashMap::new));
+            templates.forEach(template -> translations.put(template.key(), new TranslationEntry(template.numberedTemplate(), true)));
+            return translations;
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to process " + path, e);
         }
     }
 
-    private Map<String, String> extractUserStrings(String content, String artifactId) {
+    private Map<String, String> extractUserStrings(String content, String artifactId, Set<String> usedKeys) {
         Matcher matcher = STRING_LITERAL.matcher(content);
         Map<String, String> entries = new LinkedHashMap<>();
-        Set<String> usedKeys = new LinkedHashSet<>();
         while (matcher.find()) {
             String literal = matcher.group(2);
             if (!isUserVisibleCandidate(literal, matcher.start(), content)) {
@@ -167,6 +227,27 @@ public class DevUITranslatorCommand implements Runnable {
             entries.putIfAbsent(literal, key);
         }
         return entries;
+    }
+
+    private List<TemplateLocalization> extractTemplateStrings(String content, String artifactId, Set<String> usedKeys) {
+        List<TemplateLocalization> templates = new ArrayList<>();
+        Matcher matcher = TEMPLATE_LITERAL.matcher(content);
+        while (matcher.find()) {
+            String templateBody = matcher.group(1);
+            if (!templateBody.contains("${")) {
+                continue;
+            }
+            String candidate = stripPlaceholders(templateBody);
+            if (!isUserVisibleCandidate(candidate, matcher.start(), content)) {
+                continue;
+            }
+            String numbered = normalizeTemplatePlaceholders(templateBody);
+            String codeTemplate = buildTemplatePlaceholders(templateBody);
+            String key = buildKey(artifactId, candidate, usedKeys);
+            String indent = determineIndent(content, matcher.start());
+            templates.add(new TemplateLocalization("`" + templateBody + "`", numbered, codeTemplate, key, indent));
+        }
+        return templates;
     }
 
     private boolean isUserVisibleCandidate(String literal, int startIndex, String content) {
@@ -217,7 +298,50 @@ public class DevUITranslatorCommand implements Runnable {
         return candidate;
     }
 
-    private String applyLocalization(String content, Map<String, String> replacements) {
+    private String normalizeTemplatePlaceholders(String template) {
+        Matcher matcher = PLACEHOLDER_PATTERN.matcher(template);
+        StringBuilder builder = new StringBuilder();
+        int last = 0;
+        int index = 0;
+        while (matcher.find()) {
+            builder.append(template, last, matcher.start());
+            builder.append("${").append(index++).append("}");
+            last = matcher.end();
+        }
+        builder.append(template.substring(last));
+        return builder.toString();
+    }
+
+    private String buildTemplatePlaceholders(String template) {
+        Matcher matcher = PLACEHOLDER_PATTERN.matcher(template);
+        StringBuilder builder = new StringBuilder();
+        int last = 0;
+        int index = 0;
+        while (matcher.find()) {
+            builder.append(template, last, matcher.start());
+            builder.append("${placeholder").append(index++).append("}");
+            last = matcher.end();
+        }
+        builder.append(template.substring(last));
+        return builder.toString();
+    }
+
+    private String stripPlaceholders(String template) {
+        return PLACEHOLDER_PATTERN.matcher(template).replaceAll(" ").trim();
+    }
+
+    private String determineIndent(String content, int startIndex) {
+        int lineStart = content.lastIndexOf('\n', startIndex);
+        int cursor = lineStart + 1;
+        StringBuilder indent = new StringBuilder();
+        while (cursor < startIndex && Character.isWhitespace(content.charAt(cursor))) {
+            indent.append(content.charAt(cursor));
+            cursor++;
+        }
+        return indent.toString();
+    }
+
+    private String applyLocalization(String content, Map<String, String> replacements, List<TemplateLocalization> templates) {
         String updated = content;
         for (Map.Entry<String, String> entry : replacements.entrySet()) {
             String literal = entry.getKey();
@@ -230,22 +354,35 @@ public class DevUITranslatorCommand implements Runnable {
                 updated = matcher.replaceFirst(Matcher.quoteReplacement(replacement));
             }
         }
-        updated = ensureLocalizationImport(updated);
+
+        boolean usesTemplates = !templates.isEmpty();
+        for (TemplateLocalization template : templates) {
+            Pattern literalPattern = Pattern.compile(Pattern.quote(template.literal()));
+            Matcher matcher = literalPattern.matcher(updated);
+            if (matcher.find()) {
+                usesTemplates = true;
+                String replacement = wrapTemplateWithMsg(template);
+                updated = matcher.replaceFirst(Matcher.quoteReplacement(replacement));
+            }
+        }
+
+        updated = ensureLocalizationImport(updated, usesTemplates);
         updated = ensureLocaleUpdates(updated);
         return updated;
     }
 
-    private String ensureLocalizationImport(String content) {
-        if (content.contains("from 'localization'") || content.contains("from \"localization\"")) {
-            if (!content.contains("msg")) {
-                return content;
-            }
-        }
+    private String ensureLocalizationImport(String content, boolean needsTemplateSupport) {
         List<String> lines = new ArrayList<>(content.lines().toList());
-        String importLine = "import { msg, updateWhenLocaleChanges } from 'localization';";
-        boolean hasImport = lines.stream().anyMatch(line -> line.contains("from 'localization'") || line.contains("from \"localization\""));
-        if (hasImport) {
-            return content;
+        String importLine = needsTemplateSupport
+                ? "import { msg, str, updateWhenLocaleChanges } from 'localization';"
+                : "import { msg, updateWhenLocaleChanges } from 'localization';";
+        for (int i = 0; i < lines.size(); i++) {
+            if (lines.get(i).contains("from 'localization'") || lines.get(i).contains("from \"localization\"")) {
+                if (!lines.get(i).equals(importLine)) {
+                    lines.set(i, importLine);
+                }
+                return String.join("\n", lines);
+            }
         }
         int insertPos = 0;
         for (int i = 0; i < lines.size(); i++) {
@@ -267,6 +404,32 @@ public class DevUITranslatorCommand implements Runnable {
             return content.substring(0, insertPos) + "\n        updateWhenLocaleChanges(this);" + content.substring(insertPos);
         }
         return content;
+    }
+
+    private String wrapTemplateWithMsg(TemplateLocalization template) {
+        String indent = template.indent();
+        StringBuilder builder = new StringBuilder();
+        builder.append(indent).append("(() => {\n");
+        Matcher matcher = PLACEHOLDER_PATTERN.matcher(template.literal());
+        int index = 0;
+        while (matcher.find()) {
+            builder.append(indent)
+                    .append("    const placeholder")
+                    .append(index)
+                    .append(" = ")
+                    .append(matcher.group(1).trim())
+                    .append(";\n");
+            index++;
+        }
+        builder.append(indent)
+                .append("    return msg(str`")
+                .append(escapeBackticks(template.codeTemplate()))
+                .append("`, { id: '")
+                .append(template.key())
+                .append("' });\n")
+                .append(indent)
+                .append("})()");
+        return builder.toString();
     }
 
     private Map<String, TranslationEntry> mergeTranslations(Iterable<Map<String, TranslationEntry>> translations) {
@@ -307,7 +470,7 @@ public class DevUITranslatorCommand implements Runnable {
             }
             Matcher strMatcher = strPattern.matcher(content);
             while (strMatcher.find()) {
-                translations.put(strMatcher.group(1), new TranslationEntry(strMatcher.group(2), true));
+                translations.put(strMatcher.group(1), new TranslationEntry(normalizeTemplatePlaceholders(strMatcher.group(2)), true));
             }
         } catch (IOException e) {
             throw new UncheckedIOException("Failed to read translations", e);
@@ -426,6 +589,9 @@ public class DevUITranslatorCommand implements Runnable {
 
     private String escapeBackticks(String value) {
         return value.replace("`", "\\`");
+    }
+
+    private record TemplateLocalization(String literal, String numberedTemplate, String codeTemplate, String key, String indent) {
     }
 
     private record TranslationEntry(String value, boolean template) {
